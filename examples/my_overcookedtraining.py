@@ -35,4 +35,4 @@ env.add_partner_agent(partner)
 
 # Finally, you can construct an ego agent and train it in the environment
 ego = MyPPO(args)
-ego.learn(total_timesteps=10000)
+ego.learn(total_timesteps=100000)
