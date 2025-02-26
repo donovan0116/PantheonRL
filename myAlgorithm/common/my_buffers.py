@@ -506,7 +506,7 @@ class RolloutBuffer(BaseBuffer):
         action = action.reshape((self.n_envs, self.action_dim))
         comm_action = comm_action.reshape((self.n_envs, self.action_dim))
 
-        self.observations[self.pos] = np.array(obs).copy()
+        self.observations[self.pos] = np.array(obs[0]).copy()
         self.actions[self.pos] = np.array(action).copy()
         self.rewards[self.pos] = np.array(reward).copy()
         self.episode_starts[self.pos] = np.array(episode_start).copy()

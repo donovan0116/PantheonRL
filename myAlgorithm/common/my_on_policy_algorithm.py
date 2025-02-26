@@ -3,6 +3,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
 
 import numpy as np
+import torch
 import torch as th
 from gym import spaces
 
@@ -16,6 +17,10 @@ from stable_baselines3.common.vec_env import VecEnv
 
 # 引我自己的buffer
 from .my_buffers import RolloutBuffer, DictRolloutBuffer
+
+from .communicateUtils.comm_interact import comm
+from ..ImplicitRewardPolicy.ToMNet import make_fake_dataset, insert_dataset, ToMNet
+from ..ImplicitRewardPolicy.ImplicitReward import compute_reward_comm
 
 SelfOnPolicyAlgorithm = TypeVar("SelfOnPolicyAlgorithm", bound="OnPolicyAlgorithm")
 
@@ -43,6 +48,9 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
             device: Union[th.device, str] = "auto",
             _init_setup_model: bool = True,
             supported_action_spaces: Optional[Tuple[spaces.Space, ...]] = None,
+            dataset_data_num: int = 3200,
+            dataset_seq_len: int = 10,
+            tom_model = None
     ):
 
         super().__init__(
@@ -67,6 +75,17 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
         self.vf_coef = vf_coef
         self.max_grad_norm = max_grad_norm
         self.rollout_buffer = None
+        self.dataset_data_num = dataset_data_num
+        self.dataset_seq_len = dataset_seq_len
+        self.dataset = make_fake_dataset(env, self.dataset_data_num, self.dataset_seq_len)
+        self.dataset_item = []
+        self.tom_model = tom_model
+        self.hidden_old, _ = tom_model(self.dataset[0])
+        if tom_model is None:
+            self.tom_model = ToMNet(
+                input_size=env.observation_space.shape[0] + 1,
+                hidden_size=[64, 256, env.observation_space.shape[0] + 1],
+                output_size=env.observation_space.shape[0] + 1 * 10)
 
         if _init_setup_model:
             self._setup_model()
@@ -134,15 +153,18 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
 
             with th.no_grad():
                 # Convert to pytorch tensor or to TensorDict
-                obs_tensor = obs_as_tensor(self._last_obs, self.device)
-                actions, values, log_probs = self.policy(obs_tensor)
+                obs_tensor = obs_as_tensor(self._last_obs[0], self.device)
+                actions, values, log_probs = self.policy(obs_tensor.unsqueeze(0))
             actions = actions.cpu().numpy()
 
             # 收到决策action和通信action，将其分别裁剪并将决策输入env
-            # TODO：修改env后，可能还是需要输入两维的action
             action = np.array([actions[0]])
             action_comm = np.array([actions[1]])
             clipped_actions = action
+            if action_comm[0]:
+                # 当收到通信action，则进行通信
+                # 通信过程包括：1.发送action到其他agent，2.等待其他agent的回复，3.将回复的action输入self并处理
+                comm()
 
             value, value_comm = th.split(values, 1, dim=0)
 
@@ -153,9 +175,26 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
                 clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
 
             new_obs, rewards, dones, infos = env.step(clipped_actions)
-
-            # 为了测试全流程，暂时设定reward
-            reward_comm = rewards
+            partner_new_obs = new_obs.copy()
+            partner_new_obs[0] = new_obs[0][1]
+            partner_action = new_obs.copy()
+            partner_action[0] = new_obs[0][2]
+            new_obs[0] = new_obs[0][0]
+            # 已经生成队友的state和action，收集seq次组成一个tensor将其纳入dataset中
+            self.dataset_item.append(
+                torch.concat(
+                    [
+                        torch.FloatTensor(partner_new_obs[0]),
+                        torch.FloatTensor([partner_action[0]])
+                    ]
+                )
+            )
+            if len(self.dataset_item) == self.dataset_seq_len:
+                self.dataset = insert_dataset(self.dataset, self.dataset_item)
+                self.dataset_item = []
+            # 为了测试全流程，暂时设定reward_comm和reward相等
+            reward_comm = compute_reward_comm(self.dataset, self.hidden_old, self.tom_model)
+            # reward_comm = rewards
 
             self.num_timesteps += env.num_envs
 
@@ -191,7 +230,7 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
 
         with th.no_grad():
             # Compute value for the last timestep
-            value, value_comm = self.policy.predict_values(obs_as_tensor(new_obs, self.device))
+            value, value_comm = self.policy.predict_values(obs_as_tensor(new_obs[0], self.device))
 
         rollout_buffer.compute_returns_and_advantage(last_values=value, dones=dones)
         rollout_buffer.compute_returns_and_advantage_comm(last_values=value_comm, dones=dones)

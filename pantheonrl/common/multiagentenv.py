@@ -205,14 +205,17 @@ class MultiAgentEnv(gym.Env, ABC):
 
             if done:
                 ego_obs = self._old_ego_obs
-                return self.ego_extractor(ego_obs), ego_rew, done, info
+                partner_obs = self._obs[self._players.index(1 - self.ego_ind)]
+                return [self.ego_extractor(ego_obs), self.ego_extractor(partner_obs), acts[self.partnerids[0]]], ego_rew, done, info
 
             if self.ego_ind in self._players:
                 break
 
         ego_obs = self._obs[self._players.index(self.ego_ind)]
+        partner_obs = self._obs[self._players.index(1 - self.ego_ind)]
         self._old_ego_obs = ego_obs
-        return self.ego_extractor(ego_obs), ego_rew, done, info
+        # 返回值第一项：[ego的观测，partner的观测，partner的action]
+        return [self.ego_extractor(ego_obs), self.ego_extractor(partner_obs), acts[self.partnerids[0]]], ego_rew, done, info
 
     def reset(self) -> Union[Observation, Any]:
         """

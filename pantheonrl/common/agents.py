@@ -6,6 +6,7 @@ import time
 
 import numpy as np
 import torch as th
+from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 
 from .util import action_from_policy, clip_actions, resample_noise
 from .trajsaver import TransitionsMinimal
@@ -15,10 +16,11 @@ from stable_baselines3.common.utils import (
     configure_logger,
     should_collect_more_steps
 )
-from stable_baselines3.common.policies import ActorCriticPolicy
-from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
+# from stable_baselines3.common.policies import ActorCriticPolicy
+# from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 from stable_baselines3.common.utils import safe_mean
+from myAlgorithm.policies.MyIdeaPolicy import MyIdeaPolicy
 
 
 class Agent(ABC):
@@ -58,7 +60,7 @@ class StaticPolicyAgent(Agent):
     :param policy: Policy representing the agent's responses to observations
     """
 
-    def __init__(self, policy: ActorCriticPolicy):
+    def __init__(self, policy: MyIdeaPolicy):
         self.policy = policy
 
     def get_action(self, obs: Observation, record: bool = True) -> np.ndarray:

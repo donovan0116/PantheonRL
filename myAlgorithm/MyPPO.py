@@ -1,8 +1,11 @@
+import sys
+
 from gym import spaces
 from typing import Any, Dict, Optional, Type, TypeVar, Union
 
 import torch as th
 import numpy as np
+from stable_baselines3.common.logger import JSONOutputFormat
 from torch.nn import functional as F
 
 from stable_baselines3.common.utils import explained_variance, get_schedule_fn
@@ -43,6 +46,7 @@ class MyPPO(MyOnPolicyAlgorithm):
             device=args["device"],
             seed=args["seed"],
             _init_setup_model=False,
+            tom_model = args["ToM_model"],
             supported_action_spaces=(
                 spaces.Box,
                 spaces.Discrete,
