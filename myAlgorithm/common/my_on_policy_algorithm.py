@@ -14,6 +14,7 @@ from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import obs_as_tensor, safe_mean
 from stable_baselines3.common.vec_env import VecEnv
+from tensorflow.python.ops.numpy_ops import ndarray
 
 # 引我自己的buffer
 from .my_buffers import RolloutBuffer, DictRolloutBuffer
@@ -50,7 +51,7 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
             supported_action_spaces: Optional[Tuple[spaces.Space, ...]] = None,
             dataset_data_num: int = 3200,
             dataset_seq_len: int = 10,
-            tom_model = None
+            tom_model=None
     ):
 
         super().__init__(
@@ -81,6 +82,7 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
         self.dataset_item = []
         self.tom_model = tom_model
         self.hidden_old, _ = tom_model(self.dataset[0])
+        self.comm_rewards = []
         if tom_model is None:
             self.tom_model = ToMNet(
                 input_size=env.observation_space.shape[0] + 1,
@@ -194,7 +196,13 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
                 self.dataset_item = []
             # 为了测试全流程，暂时设定reward_comm和reward相等
             reward_comm = compute_reward_comm(self.dataset, self.hidden_old, self.tom_model)
+            # print(f"reward_comm: {reward_comm.item()}")
             # reward_comm = rewards
+            self.comm_rewards.append(reward_comm)
+            if dones:
+                ep_rew_comm = sum(self.comm_rewards)
+                infos[0]['episode']['r_c'] = round(ep_rew_comm, 6)
+                self.comm_rewards = []
 
             self.num_timesteps += env.num_envs
 
@@ -286,6 +294,8 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
                 if len(self.ep_info_buffer) > 0 and len(self.ep_info_buffer[0]) > 0:
                     self.logger.record("rollout/ep_rew_mean",
                                        safe_mean([ep_info["r"] for ep_info in self.ep_info_buffer]))
+                    self.logger.record("rollout/ep_rew_comm_mean",
+                                       safe_mean([ep_info["r_c"] for ep_info in self.ep_info_buffer]))
                     self.logger.record("rollout/ep_len_mean",
                                        safe_mean([ep_info["l"] for ep_info in self.ep_info_buffer]))
                 self.logger.record("time/fps", fps)

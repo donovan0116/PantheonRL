@@ -24,3 +24,5 @@ seed: null
 device: 'auto'
 _init_setup_model: True
 ToM_model: None
+ToM_model_train: False
+ToM_model_path: "./models/ToM_model/model.pth"
