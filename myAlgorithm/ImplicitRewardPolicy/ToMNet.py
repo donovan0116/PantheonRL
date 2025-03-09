@@ -1,5 +1,6 @@
 import gym
 import numpy as np
+import psutil
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -135,7 +136,9 @@ def insert_dataset(dataset, dataset_item: list):
     # 首先将其转换为tensor(10, 63)
     # 然后将其插入到dataset中
     dataset_item = torch.stack(dataset_item)
-    dataset = torch.cat((dataset, dataset_item.unsqueeze(0)), dim=0)
+    batch_size, seq_len, input_size = dataset.shape
+    batch_size += 1
+    dataset = torch.concat((dataset, dataset_item.unsqueeze(0)), dim=0)
     return dataset
 
 def batch_generator(dataset, batch_size):

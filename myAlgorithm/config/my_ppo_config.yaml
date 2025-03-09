@@ -23,6 +23,8 @@ verbose: 1
 seed: null
 device: 'auto'
 _init_setup_model: True
+fake_dataset: None
 ToM_model: None
 ToM_model_train: False
 ToM_model_path: "./models/ToM_model/model.pth"
+seq_len: 10

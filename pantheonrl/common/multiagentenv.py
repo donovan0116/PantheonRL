@@ -155,6 +155,8 @@ class MultiAgentEnv(gym.Env, ABC):
                 p = self._get_partner_num(player)
                 agent = self.partners[p][self.partnerids[p]]
                 actions.append(agent.get_action(ob))
+                # todo: 此处测试随机动作智能体是否能刺激agent发出通信
+                # actions.append(agent.model.env.action_space.sample())
                 if not self.should_update[p]:
                     agent.update(self.total_rews[player], False)
                 self.should_update[p] = True

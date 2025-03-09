@@ -33,6 +33,7 @@ def compute_reward_comm(dataset, hidden_old, tom_net, num_state_bins=100):
         entropy = -torch.sum(nonzero_probs * torch.log2(nonzero_probs))
     else:
         entropy = torch.tensor(0.0)
+    # entropy = torch.tensor(0.0)
 
     # ========== 计算 KL 散度 ==========
     hidden, _ = tom_net(dataset[:, 0, :])  # 只使用当前时间步
@@ -44,4 +45,4 @@ def compute_reward_comm(dataset, hidden_old, tom_net, num_state_bins=100):
     KL_div = F.kl_div(log_hidden_old, log_hidden.exp(), reduction='batchmean')
     assert KL_div != float('nan')
 
-    return np.array(-KL_div.item() - entropy.item())
+    return np.array(-KL_div.item() - entropy.item()), hidden

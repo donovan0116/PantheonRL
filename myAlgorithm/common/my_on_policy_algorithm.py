@@ -1,11 +1,18 @@
+import os
+import pickle
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
 
+import gym
+
 import numpy as np
 import torch
 import torch as th
+import yaml
+from anyio import value
 from gym import spaces
+from stable_baselines3 import PPO
 
 from stable_baselines3.common.base_class import BaseAlgorithm
 # from stable_baselines3.common.buffers import DictRolloutBuffer, RolloutBuffer
@@ -14,8 +21,13 @@ from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import obs_as_tensor, safe_mean
 from stable_baselines3.common.vec_env import VecEnv
+import multiprocessing
 from tensorflow.python.ops.numpy_ops import ndarray
 
+import redis
+
+from overcookedgym.overcooked_utils import LAYOUT_LIST
+from pantheonrl.common.agents import OnPolicyAgent
 # 引我自己的buffer
 from .my_buffers import RolloutBuffer, DictRolloutBuffer
 
@@ -51,7 +63,8 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
             supported_action_spaces: Optional[Tuple[spaces.Space, ...]] = None,
             dataset_data_num: int = 3200,
             dataset_seq_len: int = 10,
-            tom_model=None
+            tom_model=None,
+            fake_dataset_ = None
     ):
 
         super().__init__(
@@ -78,7 +91,7 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
         self.rollout_buffer = None
         self.dataset_data_num = dataset_data_num
         self.dataset_seq_len = dataset_seq_len
-        self.dataset = make_fake_dataset(env, self.dataset_data_num, self.dataset_seq_len)
+        self.dataset = fake_dataset_
         self.dataset_item = []
         self.tom_model = tom_model
         self.hidden_old, _ = tom_model(self.dataset[0])
@@ -91,6 +104,7 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
 
         if _init_setup_model:
             self._setup_model()
+        self.n_workers = 1
 
     def _setup_model(self) -> None:
         self._setup_lr_schedule()
@@ -118,10 +132,11 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
 
     def collect_rollouts(
             self,
-            env: VecEnv,
+            env,
             callback: BaseCallback,
             rollout_buffer: RolloutBuffer,
             n_rollout_steps: int,
+            n_workers: int = 1,
     ) -> bool:
         """
         Collect experiences using the current policy and fill a ``RolloutBuffer``.
@@ -163,10 +178,6 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
             action = np.array([actions[0]])
             action_comm = np.array([actions[1]])
             clipped_actions = action
-            if action_comm[0]:
-                # 当收到通信action，则进行通信
-                # 通信过程包括：1.发送action到其他agent，2.等待其他agent的回复，3.将回复的action输入self并处理
-                comm()
 
             value, value_comm = th.split(values, 1, dim=0)
 
@@ -176,7 +187,7 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
             if isinstance(self.action_space, spaces.Box):
                 clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
 
-            new_obs, rewards, dones, infos = env.step(clipped_actions)
+            new_obs, rewards, dones, infos = env.step([[clipped_actions[0], action_comm[0]]])
             partner_new_obs = new_obs.copy()
             partner_new_obs[0] = new_obs[0][1]
             partner_action = new_obs.copy()
@@ -195,7 +206,8 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
                 self.dataset = insert_dataset(self.dataset, self.dataset_item)
                 self.dataset_item = []
             # 为了测试全流程，暂时设定reward_comm和reward相等
-            reward_comm = compute_reward_comm(self.dataset, self.hidden_old, self.tom_model)
+            reward_comm, hidden_old = compute_reward_comm(self.dataset, self.hidden_old, self.tom_model)
+            self.hidden_old = hidden_old
             # print(f"reward_comm: {reward_comm.item()}")
             # reward_comm = rewards
             self.comm_rewards.append(reward_comm)
@@ -247,6 +259,7 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
 
         return True
 
+
     def train(self) -> None:
         """
         Consume current rollout data and update policy parameters.
@@ -277,8 +290,11 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
 
         while self.num_timesteps < total_timesteps:
 
+            # continue_training = self.collect_rollouts(self.env, callback, self.rollout_buffer,
+            #                                           n_rollout_steps=self.n_steps)
             continue_training = self.collect_rollouts(self.env, callback, self.rollout_buffer,
-                                                      n_rollout_steps=self.n_steps)
+                                                                  n_rollout_steps=self.n_steps,
+                                                                  n_workers=self.n_workers)
 
             if continue_training is False:
                 break
@@ -313,3 +329,112 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
         state_dicts = ["policy", "policy.optimizer"]
 
         return state_dicts, []
+
+    def distribute_collect_rollouts(
+            self,
+            env: VecEnv,
+            callback: BaseCallback,
+            rollout_buffer: RolloutBuffer,
+            n_rollout_steps: int,
+            n_workers: int
+    ) -> bool:
+        """
+        分布式采样
+        具体采样方法和之前采用的方法一样。
+        开启若干个worker，每个worker持有一个环境，进行无限制数量采样，每次done=True之后访问一下redis看采样的数量是否足够了
+        workers的数量和CPU核数差不多
+        """
+        dataset_ = self.dataset.clone()
+
+        import pickle
+        try:
+            pickle.dumps(sample_worker)
+            print("sample_worker can be pickled")
+        except Exception as e:
+            print(f"sample_worker cannot be pickled: {e}")
+        layout = 'simple'
+        assert layout in LAYOUT_LIST
+        with open('../myAlgorithm/config/my_ppo_config.yaml', 'r') as f:
+            config = yaml.safe_load(f)
+        args = config
+        env = gym.make(args['env']['id'], layout_name=args['env']['layout'])
+        args['env'] = env
+        partner = OnPolicyAgent(PPO('MlpPolicy', env, verbose=0, device='cpu'))
+        env.add_partner_agent(partner)
+        p1 = multiprocessing.Process(target=sample_worker,
+                                     args=(env,
+                                           self.policy,
+                                           dataset_,
+                                           self.dataset_seq_len,
+                                           self.hidden_old,
+                                           self._last_episode_starts,
+                                           n_rollout_steps,
+                                           self.device))
+        p1.start()
+        p1.join()
+        return True
+
+def sample_worker(env, policy, dataset_, seq_len, hidden_old, last_episode_starts, n_rollout_steps, device):
+        """
+        params:
+            env: 强化学习环境
+            policy: 采样策略
+            dataset：用于计算内部reward的样本
+            seq_len: lstm前推长度
+            hidden_old: 性格隐变量
+        """
+
+        r = redis.Redis(host='127.0.0.1', port=6379, db=0)
+        r.flushdb()
+        dataset_item = []
+        last_obs = env.reset()
+        n_step = 0
+        pid = os.getpid()
+        while True:
+            with th.no_grad():
+                # Convert to pytorch tensor or to TensorDict
+                obs_tensor = obs_as_tensor(last_obs, device)
+                actions, values, log_probs = policy(obs_tensor.unsqueeze(0))
+            actions = actions.cpu().numpy()
+            action = np.array([actions[0]])
+            action_comm = np.array([actions[1]])
+            clipped_actions = action
+            if action_comm[0]:
+                # 当收到通信action，则进行通信
+                # 通信过程包括：1.发送action到其他agent，2.等待其他agent的回复，3.将回复的action输入self并处理
+                comm()
+
+            value_, value_comm = th.split(values, 1, dim=0)
+            log_prob, log_prob_comm = th.split(log_probs, 1, dim=0)
+
+            if isinstance(env.action_space, spaces.Box):
+                clipped_actions = np.clip(actions, env.action_space.low, env.action_space.high)
+
+            new_obs, rewards, dones, infos = env.step(clipped_actions[0])
+            partner_new_obs = new_obs[1]
+            partner_action = new_obs[2]
+            new_obs = new_obs[0]
+            # 已经生成队友的state和action，收集seq次组成一个tensor将其纳入dataset中
+            dataset_item.append(
+                torch.concat(
+                    [
+                        torch.FloatTensor(partner_new_obs),
+                        torch.FloatTensor([partner_action])
+                    ]
+                )
+            )
+            if len(dataset_item) == seq_len:
+                # dataset_ = insert_dataset(dataset_, dataset_item)
+                dataset_item = []
+            # reward_comm = compute_reward_comm(dataset, hidden_old, self.tom_model)
+            # self.comm_rewards.append(reward_comm)
+            # todo: 计算通信reward
+            reward_comm = rewards
+            a = (last_obs, action, rewards, last_episode_starts, value_, log_prob, action_comm,
+                 reward_comm, log_prob_comm, value_comm)
+            r.set(f"{pid}_{n_step}", pickle.dumps(a))
+            n_step += 1
+            last_obs = new_obs
+            last_episode_starts = dones
+            if dones and r.dbsize() >= n_rollout_steps:
+                break

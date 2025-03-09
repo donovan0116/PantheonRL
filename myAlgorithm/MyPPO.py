@@ -47,6 +47,8 @@ class MyPPO(MyOnPolicyAlgorithm):
             seed=args["seed"],
             _init_setup_model=False,
             tom_model = args["ToM_model"],
+            fake_dataset_= args["fake_dataset"],
+            dataset_seq_len=args["seq_len"],
             supported_action_spaces=(
                 spaces.Box,
                 spaces.Discrete,
