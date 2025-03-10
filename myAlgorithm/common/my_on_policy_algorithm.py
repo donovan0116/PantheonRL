@@ -32,7 +32,7 @@ from pantheonrl.common.agents import OnPolicyAgent
 from .my_buffers import RolloutBuffer, DictRolloutBuffer
 
 from .communicateUtils.comm_interact import comm
-from ..ImplicitRewardPolicy.ToMNet import make_fake_dataset, insert_dataset, ToMNet
+from ..ImplicitRewardPolicy.ToMNet import make_fake_dataset, insert_dataset, ToMNet, train_step1, train_step2
 from ..ImplicitRewardPolicy.ImplicitReward import compute_reward_comm
 
 SelfOnPolicyAlgorithm = TypeVar("SelfOnPolicyAlgorithm", bound="OnPolicyAlgorithm")
@@ -301,6 +301,10 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
 
             iteration += 1
             self._update_current_progress_remaining(self.num_timesteps, total_timesteps)
+
+            if self.num_timesteps % 32 == 0:
+                train_step1(self.tom_model, self.dataset, 32, 100)
+                train_step2(self.tom_model, self.dataset, 32, 100)
 
             # Display training infos
             if log_interval is not None and iteration % log_interval == 0:

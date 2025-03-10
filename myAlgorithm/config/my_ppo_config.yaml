@@ -3,7 +3,7 @@ env:
   id: 'OvercookedMultiEnv-v0'
   layout: 'simple'
 learning_rate: 0.0003
-n_steps: 2048
+n_steps: 4096
 batch_size: 64
 n_epochs: 10
 gamma: 0.99

@@ -8,21 +8,21 @@ import torch.nn.functional as F
 
 
 # the function now is in discrete version
-def compute_reward_comm(dataset, hidden_old, tom_net, num_state_bins=100):
+def compute_reward_comm(dataset, hidden_old, tom_net, num_state_bins=100, epsilon=1e-10):
     batch_size, seq_len, feature_dim = dataset.shape
-    state_dim = feature_dim - 1  # 状态维度（62）
+    state_dim = feature_dim - 1
 
-    state = dataset[..., :-1]  # 形状 (batch, seq_len, 62)
-    action = dataset[..., -1].long()  # 形状 (batch, seq_len)
+    state = dataset[..., :-1]
+    action = dataset[..., -1].long()
 
     state_bins = torch.linspace(state.min(), state.max(), num_state_bins)
-    state_discrete = torch.bucketize(state, state_bins)  # 形状 (batch, seq_len, 62)
+    state_discrete = torch.bucketize(state, state_bins)
 
-    joint_hist = torch.zeros((num_state_bins, action.max().item() + 1))  # (离散状态数量, 动作类别数量)
+    joint_hist = torch.zeros((num_state_bins, action.max().item() + 1))
 
     for i in range(batch_size):
         for j in range(seq_len):
-            s_idx = state_discrete[i, j].sum().item() % num_state_bins  # 直接用状态的和 modulo 离散化
+            s_idx = state_discrete[i, j].sum().item() % num_state_bins
             a_idx = action[i, j].item()
             joint_hist[s_idx, a_idx] += 1
 
@@ -30,19 +30,23 @@ def compute_reward_comm(dataset, hidden_old, tom_net, num_state_bins=100):
         joint_prob = joint_hist / joint_hist.sum()
         joint_prob_flat = joint_prob.view(-1)
         nonzero_probs = joint_prob_flat[joint_prob_flat > 0]
-        entropy = -torch.sum(nonzero_probs * torch.log2(nonzero_probs))
+        inner_entropy = -torch.sum(nonzero_probs * torch.log2(nonzero_probs))
     else:
-        entropy = torch.tensor(0.0)
-    # entropy = torch.tensor(0.0)
+        inner_entropy = torch.tensor(0.0)
 
-    # ========== 计算 KL 散度 ==========
-    hidden, _ = tom_net(dataset[:, 0, :])  # 只使用当前时间步
-    eps = 1e-10
+    inner_entropy = torch.log1p(inner_entropy)
 
-    log_hidden = torch.log(hidden + eps)
-    log_hidden_old = torch.log(hidden_old + eps)
+    hidden, _ = tom_net(dataset[:, 0, :])
+    log_hidden = torch.log(hidden + epsilon)
+    log_hidden_old = torch.log(hidden_old + epsilon)
 
     KL_div = F.kl_div(log_hidden_old, log_hidden.exp(), reduction='batchmean')
-    assert KL_div != float('nan')
 
-    return np.array(-KL_div.item() - entropy.item()), hidden
+    KL_div_min, KL_div_max = 0.1, 1.0
+    KL_div_norm = (KL_div - KL_div_min) / (KL_div_max - KL_div_min)
+    KL_div_norm = torch.clamp(KL_div_norm, 0, 1)
+
+    lambda_entropy = 1  # 调整熵的权重
+    reward_internal = -lambda_entropy * inner_entropy - KL_div_norm
+
+    return reward_internal.item(), hidden

@@ -3,6 +3,7 @@ import numpy as np
 from typing import List, Dict, Any, Tuple
 
 import redis
+from ray.rllib.core.learner.learner import torch
 
 from myAlgorithm.ImplicitRewardPolicy.ToMNet import *
 
@@ -45,7 +46,7 @@ def main():
     batch_size = 32
     model = ToMNet(input_size=input_size, hidden_size=[64, 256, input_size], output_size=input_size * seq_len)
 
-    fake_dataset = make_fake_dataset(env, 4000, 2)
+    fake_dataset = make_fake_dataset(env, 320, 2)
     args['fake_dataset'] = fake_dataset
     train_step1(model, fake_dataset, 32, 10)
     train_step2(model, fake_dataset, 32, 10)
@@ -74,7 +75,7 @@ def main():
     env.add_agent(ego, 'ego')
     r.flushdb()
     ego.learn(total_timesteps=10000)
-
+    ego.save("ppo_model")
 
 if __name__ == "__main__":
     main()

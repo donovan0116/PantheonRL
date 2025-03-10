@@ -10,6 +10,8 @@ from stable_baselines3 import PPO
 from torch.utils.data import DataLoader
 from pantheonrl.common.agents import OnPolicyAgent
 
+MAX_DATASET_NUM = 3200
+
 
 class ToMNet(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, lamb=0.5):
@@ -146,7 +148,10 @@ def batch_generator(dataset, batch_size):
     # 分别代表批量大小、序列长度、输入维度
     # 这里设定batch_size为32，序列长度为10，输入维度为63
     while len(dataset) % batch_size != 0:
-        dataset = dataset[:-1]
+        dataset = dataset[0:]
+
+    if len(dataset) > MAX_DATASET_NUM:
+        dataset = dataset[0:MAX_DATASET_NUM]
 
     for i in range(0, len(dataset), batch_size):
         batch_data = dataset[i:i + batch_size]

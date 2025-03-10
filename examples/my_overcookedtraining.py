@@ -40,8 +40,6 @@ env.add_agent(partner, 'partner')
 
 # hyper parameters
 input_size = env.observation_space.shape[0] + 1
-lamb = 0.5
-data_num = 4000
 seq_len = 2
 args['seq_len'] = seq_len
 batch_size = 32
@@ -58,7 +56,7 @@ model = ToMNet(input_size=input_size, hidden_size=[64, 256, input_size], output_
 #     model.load_state_dict(checkpoint['model_state_dict'])
 
 # train ToMNet
-fake_dataset = make_fake_dataset(env, 4000, 2)
+fake_dataset = make_fake_dataset(env, 320, 2)
 args['fake_dataset'] = fake_dataset
 train_step1(model, fake_dataset, 32, 100)
 train_step2(model, fake_dataset, 32, 100)
@@ -70,3 +68,4 @@ ego = MyPPO(args)
 env.add_agent(ego, 'ego')
 r.flushdb()
 ego.learn(total_timesteps=1000000)
+ego.save('./ego_model/')
