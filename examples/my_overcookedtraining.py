@@ -18,9 +18,22 @@ from myAlgorithm.common.myEnv import InteractiveOvercookedEnv
 from pantheonrl.common.agents import OnPolicyAgent
 from overcookedgym.overcooked_utils import LAYOUT_LIST
 from myAlgorithm.ImplicitRewardPolicy.ToMNet import *
+from torch.multiprocessing import set_start_method
 
 layout = 'simple'
 assert layout in LAYOUT_LIST
+
+# try:
+#     set_start_method('spawn', force=True)
+# except RuntimeError:
+#     # 如果已经设置，就忽略错误
+#     pass
+
+# 安装并导入dill: pip install dill
+import dill
+import multiprocessing.reduction
+# 使用dill替换pickle
+multiprocessing.reduction.ForkingPickler = dill.Pickler
 
 with open('../myAlgorithm/config/my_ppo_config.yaml', 'r') as f:
     config = yaml.safe_load(f)
@@ -58,8 +71,8 @@ model = ToMNet(input_size=input_size, hidden_size=[64, 256, input_size], output_
 # train ToMNet
 fake_dataset = make_fake_dataset(env, 320, 2)
 args['fake_dataset'] = fake_dataset
-train_step1(model, fake_dataset, 32, 100)
-train_step2(model, fake_dataset, 32, 100)
+train_step1(model, fake_dataset, 32, 10)
+train_step2(model, fake_dataset, 32, 10)
 # torch.save(model.state_dict(), args['ToM_model_path'])
 print("training finish")
 args['ToM_model'] = model
