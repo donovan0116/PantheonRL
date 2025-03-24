@@ -10,7 +10,7 @@ from myAlgorithm.ImplicitRewardPolicy.ToMNet import *
 import yaml
 from stable_baselines3 import PPO
 
-from myAlgorithm.MyPPO import MyPPO
+from myAlgorithm.my_ppo import MyPPO
 from myAlgorithm.common.comm_agent_wrapper import SimpleCommunicativePartner
 from pantheonrl.common.agents import OnPolicyAgent
 from overcookedgym.overcooked_utils import LAYOUT_LIST

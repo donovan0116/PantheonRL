@@ -1,7 +1,6 @@
 import numpy as np
 import torch as th
 from gym import spaces
-from rlcard.games.doudizhu.utils import action
 from scipy.constants import value
 from scipy.stats import entropy
 from torch import nn

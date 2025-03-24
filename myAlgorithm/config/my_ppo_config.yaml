@@ -28,3 +28,4 @@ ToM_model: None
 ToM_model_train: False
 ToM_model_path: "./models/ToM_model/model.pth"
 seq_len: 10
+create_from_env_factory: False

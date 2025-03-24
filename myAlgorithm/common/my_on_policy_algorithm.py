@@ -1,6 +1,7 @@
 import json
 import os
 import pickle
+import cloudpickle
 import sys
 import time
 import uuid
@@ -19,27 +20,93 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.base_class import BaseAlgorithm
 # from stable_baselines3.common.buffers import DictRolloutBuffer, RolloutBuffer
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.env_util import is_wrapped
+from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import obs_as_tensor, safe_mean
-from stable_baselines3.common.vec_env import VecEnv
+from stable_baselines3.common.vec_env import (
+    VecEnv, DummyVecEnv, is_vecenv_wrapped, VecTransposeImage)
 import multiprocessing
 import multiprocessing as mp
 from torch.multiprocessing import Queue
 from tensorflow.python.ops.numpy_ops import ndarray
+from stable_baselines3.common.preprocessing import check_for_nested_spaces, is_image_space, is_image_space_channels_first
 
 import redis
+import ray
 
 from overcookedgym.overcooked_utils import LAYOUT_LIST
 from pantheonrl.common.agents import OnPolicyAgent
+from .comm_agent_wrapper import SimpleCommunicativePartner
+from .myEnv import InteractiveOvercookedEnv
 # 引我自己的buffer
 from .my_buffers import RolloutBuffer, DictRolloutBuffer
 
 from .communicateUtils.comm_interact import comm
+from .ray_rollout_worker import RolloutWorker
 from ..ImplicitRewardPolicy.ToMNet import make_fake_dataset, insert_dataset, ToMNet, train_step1, train_step2
 from ..ImplicitRewardPolicy.ImplicitReward import compute_reward_comm
 
 SelfOnPolicyAlgorithm = TypeVar("SelfOnPolicyAlgorithm", bound="OnPolicyAlgorithm")
+
+
+def env_factory(args):
+    args['create_from_env_factory'] = True
+    env = gym.make(args['env']['id'], layout_name=args['env']['layout'])
+    env = InteractiveOvercookedEnv(env)
+    args['env'] = env
+    # # 加载baseline
+    # weight_path = os.path.expanduser('~/PycharmProjects/myPRL/PantheonRL/examples/models/partner_model.zip')
+    # pretrained_partner = PPO.load(weight_path, env=env)
+    # for param in pretrained_partner.policy.parameters():
+    #     param.requires_grad = False
+    # partner = OnPolicyAgent(pretrained_partner)
+
+    partner = OnPolicyAgent(PPO('MlpPolicy', env, verbose=0))
+
+    # partner = SimpleCommunicativePartner(partner)
+    env.add_agent(partner, 'partner')
+    from ..my_ppo import MyPPO
+    ego = MyPPO(args)
+    env.add_agent(ego, 'ego')
+    return my_wrap_env(env, 1), env
+
+
+def my_wrap_env(env: GymEnv, verbose: int = 0, monitor_wrapper: bool = True) -> VecEnv:
+    if not isinstance(env, VecEnv):
+        if not is_wrapped(env, Monitor) and monitor_wrapper:
+            if verbose >= 1:
+                print("Wrapping the env with a `Monitor` wrapper")
+            env = Monitor(env)
+        if verbose >= 1:
+            print("Wrapping the env in a DummyVecEnv.")
+        env = DummyVecEnv([lambda: env])
+
+    # Make sure that dict-spaces are not nested (not supported)
+    check_for_nested_spaces(env.observation_space)
+
+    if not is_vecenv_wrapped(env, VecTransposeImage):
+        wrap_with_vectranspose = False
+        if isinstance(env.observation_space, spaces.Dict):
+            # If even one of the keys is a image-space in need of transpose, apply transpose
+            # If the image spaces are not consistent (for instance one is channel first,
+            # the other channel last), VecTransposeImage will throw an error
+            for space in env.observation_space.spaces.values():
+                wrap_with_vectranspose = wrap_with_vectranspose or (
+                        is_image_space(space) and not is_image_space_channels_first(space)
+                )
+        else:
+            wrap_with_vectranspose = is_image_space(env.observation_space) and not is_image_space_channels_first(
+                env.observation_space
+            )
+
+        if wrap_with_vectranspose:
+            if verbose >= 1:
+                print("Wrapping the env in a VecTransposeImage.")
+            env = VecTransposeImage(env)
+
+    return env
 
 
 class MyOnPolicyAlgorithm(BaseAlgorithm):
@@ -68,7 +135,10 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
             dataset_data_num: int = 3200,
             dataset_seq_len: int = 10,
             tom_model=None,
-            fake_dataset_ = None
+            fake_dataset_ = None,
+            create_from_env_factory: bool = False,
+            n_workers: int = 4,
+            redis_config: Optional[Dict[str, Any]] = None,
     ):
 
         super().__init__(
@@ -98,17 +168,51 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
         self.dataset = fake_dataset_
         self.dataset_item = []
         self.tom_model = tom_model
-        self.hidden_old, _ = tom_model(self.dataset[0])
+        if not create_from_env_factory:
+            self.hidden_old, _ = tom_model(self.dataset[0])
         self.comm_rewards = []
+        self.n_workers = n_workers
+
+        # Redis配置
+        if redis_config is None:
+            self.redis_config = {
+                "host": "localhost",
+                "port": 6379,
+                "db": 0,
+                "password": None
+            }
+        else:
+            self.redis_config = redis_config
+
+        # 初始化Redis客户端
+        self.redis_client = redis.Redis(
+            host=self.redis_config["host"],
+            port=self.redis_config["port"],
+            db=self.redis_config["db"],
+            password=self.redis_config["password"]
+        )
+
         if tom_model is None:
             self.tom_model = ToMNet(
                 input_size=env.observation_space.shape[0] + 1,
                 hidden_size=[64, 256, env.observation_space.shape[0] + 1],
                 output_size=env.observation_space.shape[0] + 1 * 10)
 
+        # 初始化hidden_old
+        if self.dataset is not None and not create_from_env_factory:
+            self.hidden_old, _ = self.tom_model(self.dataset[0])
+
         if _init_setup_model:
             self._setup_model()
-        self.n_workers = 1
+
+        # 初始化env_maker的参数
+        with open('../myAlgorithm/config/my_ppo_config.yaml', 'r') as f:
+            config = yaml.safe_load(f)
+        self.args = config
+        # self.env_args = {
+        #     "env_id": self.args['env']['id'],
+        #     "env_layout_name": self.args['env']['layout'],
+        # }
 
     def _setup_model(self) -> None:
         self._setup_lr_schedule()
@@ -133,6 +237,169 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
             **self.policy_kwargs  # pytype:disable=not-instantiable
         )
         self.policy = self.policy.to(self.device)
+
+
+    def dis_collect_rollouts(
+            self,
+            env,
+            callback: BaseCallback,
+            rollout_buffer: RolloutBuffer,
+            n_rollout_steps: int,
+            n_workers: int = None,
+            tom_model_weight = None
+    ) -> bool:
+        """
+        使用多进程和Ray框架收集experiences，并将其填入RolloutBuffer.
+
+        :param env: 训练环境
+        :param callback: 在每一步调用的回调函数
+        :param rollout_buffer: 用于填充的rollout缓冲区
+        :param n_rollout_steps: 每个环境要收集的经验数量
+        :param n_workers: 用于分布式采样的worker数量
+        :return: 如果函数至少收集了n_rollout_steps经验则返回True，
+                 如果回调函数提前终止rollout则返回False.
+        """
+        assert self._last_obs is not None, "No previous observation was provided"
+
+        if n_workers is None:
+            n_workers = self.n_workers
+
+        self.policy.set_training_mode(False)
+
+        rollout_buffer.reset()
+
+        if self.use_sde:
+            self.policy.reset_noise(env.num_envs)
+
+        callback.on_rollout_start()
+
+        session_id = str(uuid.uuid4())
+
+        # 使用cuda预先计算通信奖励
+        with th.cuda.device(0):
+            if self.tom_model is not None:
+                tom_model_cuda = self.tom_model.to('cuda')
+            else:
+                tom_model_cuda = None
+
+            if self.dataset is not None:
+                dataset_cuda = self.dataset.to('cuda')
+            else:
+                dataset_cuda = None
+
+            if self.hidden_old is not None:
+                hidden_old_cuda = self.hidden_old.to('cuda')
+            else:
+                hidden_old_cuda = None
+
+            if tom_model_cuda is not None and dataset_cuda is not None:
+                reward_comm, hidden_new = compute_reward_comm(dataset_cuda, hidden_old_cuda, tom_model_cuda)
+                self.hidden_old = hidden_new.to(self.device)
+            else:
+                reward_comm = th.tensor(0.0)
+
+        steps_per_worker = n_rollout_steps // n_workers
+        remaining_steps = n_rollout_steps % n_workers
+
+        worker_futures = []
+
+        for i in range(n_workers):
+            worker_steps = steps_per_worker
+            if i == n_workers - 1:
+                worker_steps += remaining_steps
+
+            future = self.workers[i].collect_steps.remote(
+                process_id=i,
+                # args=self.args,
+                # env_maker=env_factory,
+                policy=self.policy,
+                last_obs=self._last_obs,
+                last_episode_starts=self._last_episode_starts,
+                pre_computed_reward_comm=reward_comm,
+                session_id=session_id,
+                start_step=i * steps_per_worker,
+                n_steps_to_collect=worker_steps,
+                tom_model_weights=tom_model_weight
+            )
+            worker_futures.append(future)
+
+        worker_results = ray.get(worker_futures)
+
+        all_step_data = []
+        all_dataset_items = []
+
+        # 收集每个worker的所有步骤数据
+        for result in worker_results:
+            # 获取步骤数据
+            for step_key in result["step_keys"]:
+                step_data_bytes = self.redis_client.get(step_key)
+                if step_data_bytes:
+                    step_data = pickle.loads(step_data_bytes)
+                    all_step_data.append(step_data)
+                    # 删除已处理的数据
+                    self.redis_client.delete(step_key)
+
+            # 获取数据集项
+            for dataset_key in result["dataset_items"]:
+                dataset_bytes = self.redis_client.get(dataset_key)
+                if dataset_bytes:
+                    dataset_items = pickle.loads(dataset_bytes)
+                    dataset_items = torch.stack(dataset_items)
+                    all_dataset_items.append(dataset_items)
+                    # 删除已处理的数据
+                    self.redis_client.delete(dataset_key)
+
+            # 获取最终状态（仅使用最后一个worker的结果）
+            if result["worker_id"] == n_workers - 1:
+                final_state_bytes = self.redis_client.get(result["final_key"])
+                if final_state_bytes:
+                    final_state = pickle.loads(final_state_bytes)
+                    self._last_obs = final_state["last_obs"]
+                    self._last_episode_starts = final_state["last_episode_starts"]
+                    final_value = final_state["final_value"]
+                    final_value_comm = final_state["final_value_comm"]
+                    self.redis_client.delete(result["final_key"])
+
+        # 按照步骤顺序排序数据
+        all_step_data.sort(key=lambda x: x["step"])
+
+        # 更新数据集
+        if len(all_dataset_items) > 0:
+            self.dataset = insert_dataset(self.dataset, all_dataset_items)
+
+        # 将数据添加到rollout buffer
+        for step_data in all_step_data:
+            rollout_buffer.add(
+                step_data["last_obs"],
+                step_data["action"],
+                step_data["rewards"],
+                step_data["last_episode_starts"],
+                step_data["value"],
+                step_data["log_prob"],
+                step_data["action_comm"],
+                step_data["reward_comm"],
+                step_data["log_prob_comm"],
+                step_data["value_comm"]
+            )
+
+            # 更新info buffer
+            self._update_info_buffer(step_data["infos"])
+
+            # 更新时间步计数
+            self.num_timesteps += env.num_envs
+
+            # 给回调函数访问局部变量的权限
+            callback.update_locals(locals())
+            if callback.on_step() is False:
+                return False
+
+        # 计算returns和advantage
+        rollout_buffer.compute_returns_and_advantage(last_values=final_value, dones=self._last_episode_starts)
+        rollout_buffer.compute_returns_and_advantage_comm(last_values=final_value_comm, dones=self._last_episode_starts)
+
+        callback.on_rollout_end()
+
+        return True
 
     def collect_rollouts(
             self,
@@ -193,32 +460,29 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
                 clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
 
             new_obs, rewards, dones, infos = env.step([[clipped_actions[0], action_comm[0]]])
-            partner_new_obs = new_obs.copy()
-            partner_new_obs[0] = new_obs[0][1]
-            partner_action = new_obs.copy()
-            partner_action[0] = new_obs[0][2]
-            new_obs[0] = new_obs[0][0]
+            partner_new_obs = new_obs[1]
+            partner_action = new_obs[2]
             # 已经生成队友的state和action，收集seq次组成一个tensor将其纳入dataset中
             self.dataset_item.append(
                 torch.concat(
                     [
-                        torch.FloatTensor(partner_new_obs[0]),
-                        torch.FloatTensor([partner_action[0]])
+                        torch.FloatTensor(partner_new_obs),
+                        torch.FloatTensor([partner_action])
                     ]
                 )
             )
             if len(self.dataset_item) == self.dataset_seq_len:
                 self.dataset = insert_dataset(self.dataset, self.dataset_item)
                 self.dataset_item = []
-            # 为了测试全流程，暂时设定reward_comm和reward相等
-            reward_comm, hidden_old = compute_reward_comm(self.dataset, self.hidden_old, self.tom_model)
-            self.hidden_old = hidden_old
+
+            # reward_comm, hidden_old = compute_reward_comm(self.dataset, self.hidden_old, self.tom_model)
+            # self.hidden_old = hidden_old
             # print(f"reward_comm: {reward_comm.item()}")
-            # reward_comm = rewards
+            reward_comm = rewards
             self.comm_rewards.append(reward_comm)
             if dones:
                 ep_rew_comm = sum(self.comm_rewards)
-                infos[0]['episode']['r_c'] = round(ep_rew_comm, 6)
+                infos[0]['episode']['r_c'] = round(ep_rew_comm[0], 6)
                 self.comm_rewards = []
 
             self.num_timesteps += env.num_envs
@@ -264,232 +528,6 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
 
         return True
 
-    def collect_rollouts_multiprocess(
-            self,
-            env,
-            callback: BaseCallback,
-            rollout_buffer: RolloutBuffer,
-            n_rollout_steps: int,
-            n_workers: int = 4,
-            redis_config: Dict[str, Any] = None,
-    ) -> bool:
-        """
-        Collect experiences using the current policy and fill a ``RolloutBuffer``
-        with multiple processes.
-
-        :param env: The training environment
-        :param callback: Callback that will be called at each step
-        :param rollout_buffer: Buffer to fill with rollouts
-        :param n_rollout_steps: Number of experiences to collect per environment
-        :param n_workers: Number of worker processes
-        :param redis_config: Configuration for Redis connection
-        :return: True if function returned with at least `n_rollout_steps` collected,
-            False if callback terminated rollout prematurely.
-        """
-        assert self._last_obs is not None, "No previous observation was provided"
-
-        # 默认Redis配置
-        if redis_config is None:
-            redis_config = {
-                'host': 'localhost',
-                'port': 6379,
-                'db': 1,
-                'decode_responses': False  # 对于二进制数据设为False
-            }
-
-        # 用于JSON序列化的Redis客户端
-        redis_json_client = redis.Redis(
-            host=redis_config['host'],
-            port=redis_config['port'],
-            db=redis_config['db'],
-            decode_responses=True  # 对于JSON设为True
-        )
-
-        # 用于二进制数据的Redis客户端
-        redis_binary_client = redis.Redis(
-            host=redis_config['host'],
-            port=redis_config['port'],
-            db=redis_config['db'],
-            decode_responses=False
-        )
-
-        # 清除之前的数据
-        redis_json_client.flushdb()
-
-        # Switch to eval mode (this affects batch norm / dropout)
-        self.policy.set_training_mode(False)
-
-        # 准备回调
-        callback.on_rollout_start()
-
-        # 重置缓冲区
-        rollout_buffer.reset()
-
-        # 计算每个worker应该收集的步数
-        steps_per_worker = (n_rollout_steps + n_workers - 1) // n_workers
-
-        # 提前计算一次reward_comm，所有worker都使用这个值
-        reward_comm, hidden_old = compute_reward_comm(self.dataset, self.hidden_old, self.tom_model)
-        self.hidden_old = hidden_old
-
-        # 为每个worker创建一个环境副本
-        # 注意：这里假设环境可以被复制，如果不能，需要修改策略
-        worker_envs = [env for _ in range(n_workers)]
-
-        # 创建进程间同步对象
-        process_barrier = mp.Barrier(n_workers)
-        main_process_ready_event = mp.Event()
-        worker_ready_queue = Queue()
-
-        # 创建并启动worker进程
-        processes = []
-        for i in range(n_workers):
-            p = mp.Process(
-                target=worker_process,
-                args=(
-                    i,
-                    worker_envs[i],
-                    self.policy,
-                    self.device,
-                    self.action_space,
-                    steps_per_worker,
-                    redis_config,
-                    np.random.randint(0, 1000000),  # global_seed
-                    self.use_sde,
-                    self.sde_sample_freq,
-                    self.gamma,
-                    self.dataset_seq_len,
-                    reward_comm.item() if isinstance(reward_comm, th.Tensor) else reward_comm,
-                    process_barrier,
-                    worker_ready_queue,
-                    main_process_ready_event,
-                )
-            )
-            p.daemon = True
-            p.start()
-            processes.append(p)
-
-        # 等待所有worker准备就绪
-        worker_ids = []
-        for _ in range(n_workers):
-            worker_id = worker_ready_queue.get()
-            worker_ids.append(worker_id)
-
-        # 通知所有worker可以开始
-        main_process_ready_event.set()
-
-        # 等待所有worker完成
-        all_completed = False
-        while not all_completed:
-            time.sleep(0.1)  # 避免忙等
-            completed_count = 0
-            for worker_id in worker_ids:
-                if redis_json_client.get(f"{worker_id}:completed") == "1":
-                    completed_count += 1
-
-            if completed_count == n_workers:
-                all_completed = True
-
-        # 收集所有rollout数据并填充buffer
-        rollout_data_keys = []
-        dataset_keys = []
-
-        # 查找所有相关的键
-        for worker_id in worker_ids:
-            # 获取所有rollout键
-            worker_rollout_keys = redis_json_client.keys(f"{worker_id}:rollout:*")
-            rollout_data_keys.extend(worker_rollout_keys)
-
-            # 获取所有dataset序列键
-            worker_dataset_keys = redis_json_client.keys(f"{worker_id}:dataset_seq:*")
-            dataset_keys.extend(worker_dataset_keys)
-
-        # 排序键以确保按正确顺序处理
-        rollout_data_keys.sort(key=lambda x: int(x.split(":")[-1]))
-
-        # 处理dataset更新
-        for dataset_key in dataset_keys:
-            dataset_seq_data = json.loads(redis_json_client.get(dataset_key))
-            # 将JSON数据转换回tensor
-            tensor_seq = []
-            for item in dataset_seq_data:
-                partner_obs = torch.FloatTensor(item['partner_obs'])
-                partner_action = torch.FloatTensor([item['partner_action']])
-                tensor_seq.append(torch.concat([partner_obs, partner_action]))
-
-            # 更新主进程的dataset
-            self.dataset = insert_dataset(self.dataset, tensor_seq)
-
-        # 填充rollout buffer
-        for rollout_key in rollout_data_keys:
-            data = json.loads(redis_json_client.get(rollout_key))
-
-            # 转换回适当的数据类型
-            last_obs = np.array(data['last_obs']) if isinstance(data['last_obs'][0], list) else data['last_obs']
-            action = np.array(data['action'])
-            rewards = np.array(data['rewards'])
-            last_episode_starts = np.array(data['last_episode_starts'])
-            value = th.tensor(data['value'])
-            log_prob = th.tensor(data['log_prob'])
-            action_comm = np.array(data['action_comm'])
-            reward_comm = data['reward_comm']
-            log_prob_comm = th.tensor(data['log_prob_comm'])
-            value_comm = th.tensor(data['value_comm'])
-
-            # 添加到rollout buffer
-            rollout_buffer.add(
-                last_obs, action, rewards, last_episode_starts,
-                value, log_prob, action_comm, reward_comm,
-                log_prob_comm, value_comm
-            )
-
-            # 更新主进程的状态
-            self._last_obs = np.array(data['new_obs']) if isinstance(data['new_obs'][0], list) else data['new_obs']
-            self._last_episode_starts = np.array(data['dones'])
-
-            # 更新回调
-            # 给access to local variables
-            locals_dict = {
-                'self': self,
-                'env': env,
-                'callback': callback,
-                'rollout_buffer': rollout_buffer,
-                'n_rollout_steps': n_rollout_steps,
-                'infos': [{}],  # 这里可能需要从worker获取更详细的infos
-                'dones': np.array(data['dones']),
-                'rewards': rewards,
-                'new_obs': self._last_obs,
-                'n_steps': int(rollout_key.split(":")[-1]),
-            }
-            callback.update_locals(locals_dict)
-            if callback.on_step() is False:
-                # 清理进程
-                for p in processes:
-                    p.terminate()
-                return False
-
-        # 获取最后一个timestep的值
-        last_worker = worker_ids[-1]
-        final_data = json.loads(redis_json_client.get(f"{last_worker}:final"))
-        final_value = th.tensor(final_data['final_value'])
-        final_value_comm = th.tensor(final_data['final_value_comm'])
-        final_dones = np.array(final_data['final_dones'])
-
-        # 计算returns和advantages
-        rollout_buffer.compute_returns_and_advantage(last_values=final_value, dones=final_dones)
-        rollout_buffer.compute_returns_and_advantage_comm(last_values=final_value_comm, dones=final_dones)
-
-        callback.on_rollout_end()
-
-        # 清理进程
-        for p in processes:
-            p.join()
-
-        # 清理Redis数据
-        redis_json_client.flushdb()
-
-        return True
-
 
     def train(self) -> None:
         """
@@ -518,14 +556,17 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
         )
 
         callback.on_training_start(locals(), globals())
+        tom_model_weight = self.tom_model.state_dict()
 
         while self.num_timesteps < total_timesteps:
 
             # continue_training = self.collect_rollouts(self.env, callback, self.rollout_buffer,
             #                                                       n_rollout_steps=self.n_steps,
             #                                                       n_workers=self.n_workers)
-            continue_training = self.collect_rollouts_multiprocess(self.env, callback, self.rollout_buffer,
-                                                                 n_rollout_steps=self.n_steps)
+            continue_training = self.dis_collect_rollouts(self.env, callback, self.rollout_buffer,
+                                                          n_rollout_steps=self.n_steps,
+                                                          n_workers=self.n_workers,
+                                                          tom_model_weight=tom_model_weight)
 
             if continue_training is False:
                 break
@@ -536,6 +577,7 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
             if self.num_timesteps % 32 == 0:
                 train_step1(self.tom_model, self.dataset, 32, 100)
                 train_step2(self.tom_model, self.dataset, 32, 100)
+                tom_model_weight = self.tom_model.state_dict()
 
             # Display training infos
             if log_interval is not None and iteration % log_interval == 0:
@@ -564,192 +606,3 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
         state_dicts = ["policy", "policy.optimizer"]
 
         return state_dicts, []
-
-def worker_process(
-        process_id: int,
-        env,
-        policy,
-        device,
-        action_space,
-        steps_per_worker: int,
-        redis_config: Dict[str, Any],
-        global_seed: int,
-        use_sde: bool,
-        sde_sample_freq: int,
-        gamma: float,
-        dataset_seq_len: int,
-        pre_computed_reward_comm: float,
-        process_barrier: mp.Barrier,
-        worker_ready_queue: Queue,
-        main_process_ready_event: mp.Event,
-):
-    """
-    Worker process to collect rollouts
-
-    :param process_id: ID of this worker process
-    :param env: The training environment (copied for each worker)
-    :param policy: The policy to use for rollout collection
-    :param device: Device to use for tensor operations
-    :param action_space: Action space of the environment
-    :param steps_per_worker: Number of steps to collect per worker
-    :param redis_config: Configuration for Redis connection
-    :param global_seed: Seed for random number generators
-    :param use_sde: Whether to use state-dependent exploration
-    :param sde_sample_freq: Frequency of noise matrix resampling
-    :param gamma: Discount factor
-    :param dataset_seq_len: Length of dataset sequence
-    :param pre_computed_reward_comm: Pre-computed communication reward
-    :param process_barrier: Barrier for process synchronization
-    :param worker_ready_queue: Queue to signal worker is ready
-    :param main_process_ready_event: Event to wait for main process
-    """
-    # Set worker seed for reproducibility
-    np.random.seed(global_seed + process_id)
-    th.manual_seed(global_seed + process_id)
-
-    # 连接到Redis
-    r = redis.Redis(**redis_config)
-
-    # 初始化本地状态
-    worker_last_obs = env.reset()
-    worker_last_episode_starts = np.ones((env.num_envs,), dtype=bool)
-    dataset_item = []
-    comm_rewards = []
-    n_steps = 0
-
-    # 生成唯一的worker ID
-    worker_id = f"worker_{process_id}_{uuid.uuid4().hex[:8]}"
-
-    # Switch to eval mode (this affects batch norm / dropout)
-    policy.set_training_mode(False)
-
-    # Sample new weights for the state dependent exploration
-    if use_sde:
-        policy.reset_noise(env.num_envs)
-
-    # 通知主进程worker已准备好
-    worker_ready_queue.put(worker_id)
-
-    # 等待主进程准备完成
-    main_process_ready_event.wait()
-
-    # 同步所有worker开始工作
-    process_barrier.wait()
-
-    # 开始收集rollout
-    while n_steps < steps_per_worker:
-        if use_sde and sde_sample_freq > 0 and n_steps % sde_sample_freq == 0:
-            # Sample a new noise matrix
-            policy.reset_noise(env.num_envs)
-
-        with th.no_grad():
-            # Convert to pytorch tensor
-            obs_tensor = obs_as_tensor(worker_last_obs[0], device)
-            actions, values, log_probs = policy(obs_tensor.unsqueeze(0))
-
-        actions = actions.cpu().numpy()
-
-        # 收到决策action和通信action，将其分别裁剪并将决策输入env
-        action = np.array([actions[0]])
-        action_comm = np.array([actions[1]])
-        clipped_actions = action
-
-        value, value_comm = th.split(values, 1, dim=0)
-        log_prob, log_prob_comm = th.split(log_probs, 1, dim=0)
-
-        # Clip the actions to avoid out of bound error
-        if isinstance(action_space, spaces.Box):
-            clipped_actions = np.clip(actions, action_space.low, action_space.high)
-
-        new_obs, rewards, dones, infos = env.step([[clipped_actions[0], action_comm[0]]])
-        partner_new_obs = new_obs.copy()
-        partner_new_obs[0] = new_obs[0][1]
-        partner_action = new_obs.copy()
-        partner_action[0] = new_obs[0][2]
-        new_obs[0] = new_obs[0][0]
-
-        # 收集partner的state和action，但不直接进行tensor concat，而是存入Redis
-        partner_data = {
-            'partner_obs': partner_new_obs[0].tolist(),
-            'partner_action': partner_action[0].tolist()
-        }
-
-        dataset_item.append(partner_data)
-
-        if len(dataset_item) == dataset_seq_len:
-            # 将序列存入Redis, 主进程会负责更新dataset
-            dataset_key = f"{worker_id}:dataset_seq:{n_steps}"
-            r.set(dataset_key, json.dumps(dataset_item))
-            dataset_item = []
-
-        # 使用预计算的reward_comm
-        reward_comm = pre_computed_reward_comm
-        comm_rewards.append(reward_comm)
-
-        if dones:
-            ep_rew_comm = sum(comm_rewards)
-            infos[0]['episode']['r_c'] = round(ep_rew_comm, 6)
-            comm_rewards = []
-
-        n_steps += 1
-
-        if isinstance(action_space, spaces.Discrete):
-            # Reshape in case of discrete action
-            actions = actions.reshape(-1, 1)
-
-        # Handle timeout by bootstraping with value function
-        for idx, done in enumerate(dones):
-            if (
-                    done
-                    and infos[idx].get("terminal_observation") is not None
-                    and infos[idx].get("TimeLimit.truncated", False)
-            ):
-                terminal_obs = policy.obs_to_tensor(infos[idx]["terminal_observation"])[0]
-                with th.no_grad():
-                    terminal_value = policy.predict_values(terminal_obs)[0]
-                rewards[idx] += gamma * terminal_value
-
-        # 将rollout数据保存到Redis
-        rollout_data = {
-            'last_obs': worker_last_obs.tolist() if isinstance(worker_last_obs, np.ndarray) else [
-                o.tolist() if isinstance(o, np.ndarray) else o for o in worker_last_obs],
-            'action': action.tolist(),
-            'rewards': rewards.tolist() if isinstance(rewards, np.ndarray) else rewards,
-            'last_episode_starts': worker_last_episode_starts.tolist(),
-            'value': value.cpu().numpy().tolist(),
-            'log_prob': log_prob.cpu().numpy().tolist(),
-            'action_comm': action_comm.tolist(),
-            'reward_comm': reward_comm if not isinstance(reward_comm, (
-                np.ndarray, th.Tensor)) else reward_comm.tolist() if isinstance(reward_comm,
-                                                                                np.ndarray) else reward_comm.cpu().numpy().tolist(),
-            'log_prob_comm': log_prob_comm.cpu().numpy().tolist(),
-            'value_comm': value_comm.cpu().numpy().tolist(),
-            'new_obs': new_obs.tolist() if isinstance(new_obs, np.ndarray) else [
-                o.tolist() if isinstance(o, np.ndarray) else o for o in new_obs],
-            'dones': dones.tolist() if isinstance(dones, np.ndarray) else dones,
-        }
-
-        # 存储到Redis
-        rollout_key = f"{worker_id}:rollout:{n_steps}"
-        r.set(rollout_key, json.dumps(rollout_data))
-
-        worker_last_obs = new_obs
-        worker_last_episode_starts = dones
-
-    # 将最后一个timestep的值计算并存入Redis
-    with th.no_grad():
-        final_value, final_value_comm = policy.predict_values(obs_as_tensor(new_obs[0], device))
-
-    final_data = {
-        'final_value': final_value.cpu().numpy().tolist(),
-        'final_value_comm': final_value_comm.cpu().numpy().tolist(),
-        'final_dones': dones.tolist() if isinstance(dones, np.ndarray) else dones,
-    }
-
-    r.set(f"{worker_id}:final", json.dumps(final_data))
-
-    # 通知完成
-    r.set(f"{worker_id}:completed", "1")
-
-    # 等待所有worker完成
-    process_barrier.wait()

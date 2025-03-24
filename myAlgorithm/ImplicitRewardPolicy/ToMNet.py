@@ -59,7 +59,11 @@ def train_step1(model_, dataset, batch_size=32, epoch=10, recon_loss_fn=None, op
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            print("[Training 1] epoch:{}, step: {}, loss: {}".format(i, batch_idx, loss.item()))
+        if i % 10 == 0:
+            print("[Training 1] epoch:{}, loss: {}".format(i, loss.item()))
+        if loss.item() < 0.0015:
+            # 防止过拟合
+            return
 
 
 # in the second step of training, we train the ToMNet in representation space
@@ -85,7 +89,8 @@ def train_step2(model_, dataset, batch_size=32, epoch=10, optimizer=None):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            print("[Training 2] epoch:{}, step: {}, loss: {}".format(i, batch_idx, loss.item()))
+        if i % 10 == 0:
+            print("[Training 2] epoch:{}, loss: {}".format(i, loss.item()))
 
 
 # compute the cosine metrix C
@@ -101,34 +106,41 @@ def metrix_c(z, z_p):
     return result
 
 
-def make_fake_dataset(env, data_num, seq_len):
-    """
-    params:
-    env: env that used to sample
-    data_num: the num of data, one data with the structure of :
-    Tensor[[s_1, a_1], [s_2, a_2], ...]
-    """
+def make_fake_dataset(env, data_num, seq_len, device='cuda'):
     result = []
     result_in_one_seq = []
     state = env.reset()
     act = env.action_space.sample()
+
+    # Pre-allocate a list to store sequence tensors
+    sequences = []
+
     for i in range(data_num):
-        state, reward, done, _ = env.step(act)
+        state, reward, done, *_ = env.step(act)
+
+        # Handle different state formats
         if isinstance(state, list):
             result_in_one_seq.append(np.append(state[0], float(act)))
         else:
             result_in_one_seq.append(np.append(state, float(act)))
+
         if len(result_in_one_seq) == seq_len:
-            result.append(torch.FloatTensor(result_in_one_seq))
+            with torch.no_grad():
+                seq_tensor = torch.tensor(result_in_one_seq,
+                                          dtype=torch.float32,
+                                          device=device)
+            sequences.append(seq_tensor.unsqueeze(0))
             result_in_one_seq = []
         act = env.action_space.sample()
         if done:
             state = env.reset()
-    for i in range(len(result)):
-        # 数据集中每一项转换成tensor
+    if sequences:
         with torch.no_grad():
-            result[i] = torch.tensor(result[i]).float().unsqueeze(0)
-    result = torch.concat(result).detach()
+            result = torch.cat(sequences, dim=0).detach()
+    else:
+        result = torch.empty(0, seq_len, len(result_in_one_seq[0]) if result_in_one_seq else 0,
+                             dtype=torch.float32, device=device)
+
     return result
 
 def insert_dataset(dataset, dataset_item: list):
@@ -137,10 +149,10 @@ def insert_dataset(dataset, dataset_item: list):
     # list的长度是seq_len，每一项的长度是state_dim+action_dim
     # 首先将其转换为tensor(10, 63)
     # 然后将其插入到dataset中
-    dataset_item = torch.stack(dataset_item)
-    batch_size, seq_len, input_size = dataset.shape
-    batch_size += 1
-    dataset = torch.concat((dataset, dataset_item.unsqueeze(0)), dim=0)
+    dataset_item = torch.stack(dataset_item).to('cuda')
+    if dataset_item.dim() == 2:
+        dataset_item = dataset_item.unsqueeze(0)
+    dataset = torch.concat((dataset, dataset_item), dim=0)
     return dataset
 
 def batch_generator(dataset, batch_size):

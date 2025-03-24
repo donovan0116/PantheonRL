@@ -11,8 +11,9 @@ import redis
 import torch
 import yaml
 from stable_baselines3 import PPO
+import cloudpickle
 
-from myAlgorithm.MyPPO import MyPPO
+from myAlgorithm.my_ppo import MyPPO
 from myAlgorithm.common.comm_agent_wrapper import SimpleCommunicativePartner
 from myAlgorithm.common.myEnv import InteractiveOvercookedEnv
 from pantheonrl.common.agents import OnPolicyAgent
@@ -22,18 +23,6 @@ from torch.multiprocessing import set_start_method
 
 layout = 'simple'
 assert layout in LAYOUT_LIST
-
-# try:
-#     set_start_method('spawn', force=True)
-# except RuntimeError:
-#     # 如果已经设置，就忽略错误
-#     pass
-
-# 安装并导入dill: pip install dill
-import dill
-import multiprocessing.reduction
-# 使用dill替换pickle
-multiprocessing.reduction.ForkingPickler = dill.Pickler
 
 with open('../myAlgorithm/config/my_ppo_config.yaml', 'r') as f:
     config = yaml.safe_load(f)
@@ -48,7 +37,7 @@ r = redis.Redis(host='127.0.0.1', port=6379, db=0)
 r.flushdb()
 
 partner = OnPolicyAgent(PPO('MlpPolicy', env, verbose=0))
-partner = SimpleCommunicativePartner(partner)
+# partner = SimpleCommunicativePartner(partner)
 env.add_agent(partner, 'partner')
 
 # hyper parameters
@@ -69,6 +58,7 @@ model = ToMNet(input_size=input_size, hidden_size=[64, 256, input_size], output_
 #     model.load_state_dict(checkpoint['model_state_dict'])
 
 # train ToMNet
+model = model.to('cuda')
 fake_dataset = make_fake_dataset(env, 320, 2)
 args['fake_dataset'] = fake_dataset
 train_step1(model, fake_dataset, 32, 10)
@@ -80,5 +70,6 @@ args['ToM_model'] = model
 ego = MyPPO(args)
 env.add_agent(ego, 'ego')
 r.flushdb()
-ego.learn(total_timesteps=1000000)
-ego.save('./ego_model/')
+ego.learn(total_timesteps=500000)
+# partner.model.save("./models/partner_model.zip")
+# print("training finish, partner model was stored successfully.")

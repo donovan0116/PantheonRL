@@ -46,7 +46,8 @@ class SimpleCommunicativePartner:
 
         # 尝试从文件加载策略
         self._load_strategy()
-        self.redis_handler = redis.Redis(host='127.0.0.1', port=6379, db=0)
+        # self.redis_handler = redis.Redis(host='127.0.0.1', port=6379, db=0)
+        self.comm_space_address = None
 
     def predict(self, observation, state=None, episode_start=None, deterministic=False):
         """
@@ -102,12 +103,25 @@ class SimpleCommunicativePartner:
         return selected_option['id'] - 1
 
     def get_action(self, ob):
-        if self.redis_handler.get('communication_request'):
-            comm_options = yaml.safe_load(self.redis_handler.get('communication_options'))
-            selected_index = self.handle_communication(comm_options)
-            self.redis_handler.set('communication_choice', json.dumps(selected_index))
-            self.redis_handler.delete('communication_request')
-            self.redis_handler.delete('communication_options')
+        # if self.redis_handler.get('communication_request'):
+        #     comm_options = yaml.safe_load(self.redis_handler.get('communication_options'))
+        #     selected_index = self.handle_communication(comm_options)
+        #     self.redis_handler.set('communication_choice', json.dumps(selected_index))
+        #     self.redis_handler.delete('communication_request')
+        #     self.redis_handler.delete('communication_options')
+        if self.comm_space_address:
+            with open(self.comm_space_address, 'r') as f:
+                config_ = yaml.safe_load(f)
+            if config_['communication_request']:
+                comm_options = yaml.safe_load(config_['communication_options'])
+                selected_index = self.handle_communication(comm_options)
+                config_['communication_choice'] = selected_index
+                with open(self.comm_space_address, 'w') as f:
+                    yaml.dump(config_, f)
+                    config_['communication_request'] = False
+                    config_['communication_options'] = None
+
+
         if hasattr(self.model, 'get_action'):
             return self.model.get_action(ob)
 

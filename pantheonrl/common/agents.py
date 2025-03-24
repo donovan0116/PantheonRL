@@ -154,7 +154,13 @@ class OnPolicyAgent(Agent):
                     exclude="tensorboard")
                 self.model.logger.dump(step=self.num_timesteps)
 
-            self.model.train()
+            # 检查 partner 模型是否存在需要梯度的参数
+            if any(param.requires_grad for param in self.model.policy.parameters()):
+                self.model.train()
+            else:
+                # 如果所有参数都被冻结，则跳过反向传播
+                print("Partner model is frozen, skipping backward() for partner loss.")
+            # self.model.train()
             self.iteration += 1
             buf.reset()
             self.n_steps = 0

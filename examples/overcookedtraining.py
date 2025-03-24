@@ -4,6 +4,8 @@ This is a simple example training script for PantheonRL.
 To run this script, remember to first install overcooked
 via the instructions in the README.md
 """
+import pickle
+import cloudpickle
 
 import gym
 from stable_baselines3 import PPO
@@ -24,7 +26,13 @@ env = gym.make('OvercookedMultiEnv-v0', layout_name=layout)
 # verbose to true for these agents, you can also see their learning progress
 partner = OnPolicyAgent(PPO('MlpPolicy', env, verbose=1))
 env.add_partner_agent(partner)
+with open("./env.pkl", "wb") as f:
+    cloudpickle.dump(env, f)
+
+with open("./env.pkl", "rb") as f:
+    my_env = cloudpickle.load(f)
 
 # Finally, you can construct an ego agent and train it in the environment
 ego = PPO('MlpPolicy', env, verbose=1)
 ego.learn(total_timesteps=10000)
+

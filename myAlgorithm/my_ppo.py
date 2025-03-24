@@ -1,5 +1,6 @@
 import sys
 
+import ray
 from gym import spaces
 from typing import Any, Dict, Optional, Type, TypeVar, Union
 
@@ -12,7 +13,8 @@ from stable_baselines3.common.utils import explained_variance, get_schedule_fn
 from stable_baselines3.common.type_aliases import MaybeCallback
 from stable_baselines3.common.policies import ActorCriticCnnPolicy, ActorCriticPolicy, BasePolicy, MultiInputActorCriticPolicy
 
-from .common.my_on_policy_algorithm import MyOnPolicyAlgorithm
+from .common.my_on_policy_algorithm import MyOnPolicyAlgorithm, env_factory
+from .common.ray_rollout_worker import RolloutWorker
 from .policies.MyActorCriticPolicy import MyActorCriticPolicy
 from .policies.MyIdeaPolicy import MyIdeaPolicy
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
@@ -49,12 +51,7 @@ class MyPPO(MyOnPolicyAlgorithm):
             tom_model = args["ToM_model"],
             fake_dataset_= args["fake_dataset"],
             dataset_seq_len=args["seq_len"],
-            supported_action_spaces=(
-                spaces.Box,
-                spaces.Discrete,
-                spaces.MultiDiscrete,
-                spaces.MultiBinary,
-            ),
+            create_from_env_factory=args["create_from_env_factory"],
         )
 
         if args["normalize_advantage"]:
@@ -71,6 +68,36 @@ class MyPPO(MyOnPolicyAlgorithm):
 
         if args["_init_setup_model"]:
             self._setup_model()
+
+        input_size = args["env"].observation_space.shape[0] + 1
+        self.tom_model_config = {
+            "input_size": input_size,
+            "hidden_size": [64, 256, input_size],
+            "output_size": input_size * self.dataset_seq_len
+        }
+
+        # 初始化Ray（如果尚未初始化）
+        if not ray.is_initialized():
+            ray.init()
+            # 初始化Ray workers
+            self.workers = []
+            for i in range(self.n_workers):
+                worker = RolloutWorker.remote(
+                    worker_id=i,
+                    args=self.args,
+                    env_maker=env_factory,
+                    policy=self.policy,
+                    observation_space=self.observation_space,
+                    action_space=self.action_space,
+                    device=self.device,
+                    gamma=self.gamma,
+                    use_sde=self.use_sde,
+                    sde_sample_freq=self.sde_sample_freq,
+                    dataset_seq_len=self.dataset_seq_len,
+                    redis_config=self.redis_config,
+                    tom_model_config=self.tom_model_config,
+                )
+                self.workers.append(worker)
 
     def _setup_model(self) -> None:
         super()._setup_model()

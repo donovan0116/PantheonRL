@@ -16,6 +16,7 @@ def compute_reward_comm(dataset, hidden_old, tom_net, num_state_bins=100, epsilo
     action = dataset[..., -1].long()
 
     state_bins = torch.linspace(state.min(), state.max(), num_state_bins)
+    state_bins = state_bins.to(state.device)
     state_discrete = torch.bucketize(state, state_bins)
 
     joint_hist = torch.zeros((num_state_bins, action.max().item() + 1))

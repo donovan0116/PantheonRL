@@ -11,3 +11,6 @@ trajs/
 models/
 .idea/
 .mypy_cache/
+examples/ego_model
+examples/logs/
+examples/models
