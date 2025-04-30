@@ -1,6 +1,7 @@
 import numpy as np
 import torch as th
 from gym import spaces
+from gym.spaces import Discrete
 from scipy.constants import value
 from scipy.stats import entropy
 from torch import nn
@@ -57,6 +58,7 @@ class MyIdeaPolicy(BasePolicy):
 
         self.activation_fn = activation_fn
         self.ortho_init = ortho_init
+        comm_action_space = Discrete(2)
 
         """
         默认net_arch
@@ -82,6 +84,7 @@ class MyIdeaPolicy(BasePolicy):
         self.main_value_net = nn.Linear(self.main_mlp.latent_dim_vf, 1)
         # **通信网络**（comm network）：决定是否通信
         self.comm_mlp = MlpExtractor(observation_space.shape[0], comm_net_arch, activation_fn)
+        self.comm_action_dist = make_proba_distribution(comm_action_space)
         self.comm_action_net = nn.Linear(self.comm_mlp.latent_dim_pi, 1)
         self.comm_value_net = nn.Linear(self.comm_mlp.latent_dim_vf, 1)
 
@@ -104,7 +107,7 @@ class MyIdeaPolicy(BasePolicy):
         comm_latent_pi, comm_latent_vf = self.comm_mlp(obs)
         # action_comm = th.sigmoid(self.comm_action_net(comm_latent_pi))  # 通信决策
         action_comm_mean = self.comm_action_net(comm_latent_pi)
-        action_comm_distribution = self.action_dist.proba_distribution(action_comm_mean)
+        action_comm_distribution = self.comm_action_dist.proba_distribution(action_comm_mean)
         action_comm = action_comm_distribution.get_actions()
         log_prob_comm = action_comm_distribution.log_prob(action_comm)
         value_comm = self.comm_value_net(comm_latent_vf)
@@ -127,7 +130,7 @@ class MyIdeaPolicy(BasePolicy):
 
         comm_latent_pi, comm_latent_vf = self.comm_mlp(obs)
         action_comm_mean = self.comm_action_net(comm_latent_pi)
-        action_comm_distribution = self.action_dist.proba_distribution(action_comm_mean)
+        action_comm_distribution = self.comm_action_dist.proba_distribution(action_comm_mean)
         log_prob_comm = action_comm_distribution.log_prob(actions_comm)
         entropy_comm = action_comm_distribution.entropy()
         value_comm = self.comm_value_net(comm_latent_vf)

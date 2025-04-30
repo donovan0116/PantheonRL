@@ -62,8 +62,8 @@ class InteractiveOvercookedEnv(gym.Wrapper):
                 }
             }
         ]
-        # self.redis_handler = redis.Redis(host='127.0.0.1', port=6379, db=0)
-        self.comm_space_address = './comm_space.yaml'
+        self.redis_handler = redis.Redis(host='127.0.0.1', port=6379, db=0)
+        # self.comm_space_address = './comm_space.yaml'
 
     def add_agent(self, agent, role='ego'):
         """
@@ -213,43 +213,43 @@ class InteractiveOvercookedEnv(gym.Wrapper):
         if isinstance(action, list):
             action_comm = action[1]
             action = action[0]
-        # if action_comm:
-        #     communication_options = self._initiate_communication('ego')
-        #     self.redis_handler.set('communication_request', '1')
-        #     self.redis_handler.set('communication_options', json.dumps(communication_options))
-        #
-        # next_state, reward, done, info = self.env.step(action)
-        # partner_state = next_state[1]
-        # partner_action = next_state[2]
-        #
-        # # partner模拟通信响应（实际应由人类或智能体决策）
-        # if self.communication_state['is_communicating']:
-        #     communication_choice = yaml.safe_load(self.redis_handler.get('communication_choice'))
-        #     if communication_choice:
-        #         self.handle_communication_response(communication_choice)
-        #         self.redis_handler.delete('communication_choice')
         if action_comm:
             communication_options = self._initiate_communication('ego')
-            with open(self.comm_space_address, 'r') as f:
-                config = yaml.safe_load(f)
+            self.redis_handler.set('communication_request', '1')
+            self.redis_handler.set('communication_options', json.dumps(communication_options))
 
-            config['communication_request'] = '1'
-            config['communication_options'] = communication_options
         next_state, reward, done, info = self.env.step(action)
         partner_state = next_state[1]
         partner_action = next_state[2]
 
+        # partner模拟通信响应（实际应由人类或智能体决策）
         if self.communication_state['is_communicating']:
-            with open(self.comm_space_address, 'r') as f:
-                config = yaml.safe_load(f)
-            communication_choice = config['communication_choice']
+            communication_choice = yaml.safe_load(self.redis_handler.get('communication_choice'))
             if communication_choice:
                 self.handle_communication_response(communication_choice)
-                with open(self.comm_space_address, 'r') as f:
-                    config = yaml.safe_load(f)
-                config['communication_choice'] = None
-                with open(self.comm_space_address, 'w') as f:
-                    yaml.dump(config, f)
+                self.redis_handler.delete('communication_choice')
+        # if action_comm:
+        #     communication_options = self._initiate_communication('ego')
+        #     with open(self.comm_space_address, 'r') as f:
+        #         config = yaml.safe_load(f)
+        #
+        #     config['communication_request'] = '1'
+        #     config['communication_options'] = communication_options
+        # next_state, reward, done, info = self.env.step(action)
+        # partner_state = next_state[1]
+        # partner_action = next_state[2]
+        #
+        # if self.communication_state['is_communicating']:
+        #     with open(self.comm_space_address, 'r') as f:
+        #         config = yaml.safe_load(f)
+        #     communication_choice = config['communication_choice']
+        #     if communication_choice:
+        #         self.handle_communication_response(communication_choice)
+        #         with open(self.comm_space_address, 'r') as f:
+        #             config = yaml.safe_load(f)
+        #         config['communication_choice'] = None
+        #         with open(self.comm_space_address, 'w') as f:
+        #             yaml.dump(config, f)
 
         return next_state, reward, done, info
 

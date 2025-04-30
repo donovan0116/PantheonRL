@@ -168,6 +168,7 @@ class OnPolicyAgent(Agent):
         resample_noise(self.model, self.n_steps)
 
         actions, values, log_probs = action_from_policy(obs, self.model.policy)
+        actions = th.randint(0, 6, actions.shape)
 
         # modify the rollout buffer with newest info
         if record:

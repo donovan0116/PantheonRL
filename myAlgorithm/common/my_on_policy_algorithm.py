@@ -14,6 +14,7 @@ import torch
 import torch as th
 import yaml
 from anyio import value
+from click.core import batch
 from gym import spaces
 from stable_baselines3 import PPO
 
@@ -45,7 +46,8 @@ from .my_buffers import RolloutBuffer, DictRolloutBuffer
 
 from .communicateUtils.comm_interact import comm
 from .ray_rollout_worker import RolloutWorker
-from ..ImplicitRewardPolicy.ToMNet import make_fake_dataset, insert_dataset, ToMNet, train_step1, train_step2
+from ..ImplicitRewardPolicy.ToMNet import make_fake_dataset, insert_dataset, ToMNet, train_step1, train_step2, \
+    pre_process_dataset
 from ..ImplicitRewardPolicy.ImplicitReward import compute_reward_comm
 
 SelfOnPolicyAlgorithm = TypeVar("SelfOnPolicyAlgorithm", bound="OnPolicyAlgorithm")
@@ -65,7 +67,7 @@ def env_factory(args):
 
     partner = OnPolicyAgent(PPO('MlpPolicy', env, verbose=0))
 
-    # partner = SimpleCommunicativePartner(partner)
+    partner = SimpleCommunicativePartner(partner)
     env.add_agent(partner, 'partner')
     from ..my_ppo import MyPPO
     ego = MyPPO(args)
@@ -138,6 +140,7 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
             fake_dataset_ = None,
             create_from_env_factory: bool = False,
             n_workers: int = 4,
+            batch_size: int = 32,
             redis_config: Optional[Dict[str, Any]] = None,
     ):
 
@@ -169,7 +172,7 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
         self.dataset_item = []
         self.tom_model = tom_model
         if not create_from_env_factory:
-            self.hidden_old, _ = tom_model(self.dataset[0])
+            self.hidden_old, _ = tom_model(self.dataset[0:batch_size])
         self.comm_rewards = []
         self.n_workers = n_workers
 
@@ -200,7 +203,7 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
 
         # 初始化hidden_old
         if self.dataset is not None and not create_from_env_factory:
-            self.hidden_old, _ = self.tom_model(self.dataset[0])
+            self.hidden_old, _ = self.tom_model(self.dataset[0:batch_size])
 
         if _init_setup_model:
             self._setup_model()
@@ -293,7 +296,9 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
                 hidden_old_cuda = None
 
             if tom_model_cuda is not None and dataset_cuda is not None:
-                reward_comm, hidden_new = compute_reward_comm(dataset_cuda, hidden_old_cuda, tom_model_cuda)
+                reward_comm, hidden_new = compute_reward_comm(
+                    dataset_cuda, hidden_old_cuda, tom_model_cuda, batch_size=self.batch_size)
+
                 self.hidden_old = hidden_new.to(self.device)
             else:
                 reward_comm = th.tensor(0.0)
@@ -475,14 +480,16 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
                 self.dataset = insert_dataset(self.dataset, self.dataset_item)
                 self.dataset_item = []
 
-            # reward_comm, hidden_old = compute_reward_comm(self.dataset, self.hidden_old, self.tom_model)
-            # self.hidden_old = hidden_old
+            reward_comm, hidden_old = compute_reward_comm(
+                self.dataset, self.hidden_old, self.tom_model, batch_size=self.batch_size)
+
+            self.hidden_old = hidden_old
             # print(f"reward_comm: {reward_comm.item()}")
-            reward_comm = rewards
+            # reward_comm = rewards
             self.comm_rewards.append(reward_comm)
             if dones:
                 ep_rew_comm = sum(self.comm_rewards)
-                infos[0]['episode']['r_c'] = round(ep_rew_comm[0], 6)
+                infos[0]['episode']['r_c'] = round(ep_rew_comm, 6)
                 self.comm_rewards = []
 
             self.num_timesteps += env.num_envs
@@ -560,13 +567,13 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
 
         while self.num_timesteps < total_timesteps:
 
-            # continue_training = self.collect_rollouts(self.env, callback, self.rollout_buffer,
-            #                                                       n_rollout_steps=self.n_steps,
-            #                                                       n_workers=self.n_workers)
-            continue_training = self.dis_collect_rollouts(self.env, callback, self.rollout_buffer,
-                                                          n_rollout_steps=self.n_steps,
-                                                          n_workers=self.n_workers,
-                                                          tom_model_weight=tom_model_weight)
+            continue_training = self.collect_rollouts(self.env, callback, self.rollout_buffer,
+                                                                  n_rollout_steps=self.n_steps,
+                                                                  n_workers=self.n_workers)
+            # continue_training = self.dis_collect_rollouts(self.env, callback, self.rollout_buffer,
+            #                                               n_rollout_steps=self.n_steps,
+            #                                               n_workers=self.n_workers,
+            #                                               tom_model_weight=tom_model_weight)
 
             if continue_training is False:
                 break
@@ -574,9 +581,11 @@ class MyOnPolicyAlgorithm(BaseAlgorithm):
             iteration += 1
             self._update_current_progress_remaining(self.num_timesteps, total_timesteps)
 
+            self.dataset = pre_process_dataset(self.dataset, self.batch_size)
+
             if self.num_timesteps % 32 == 0:
-                train_step1(self.tom_model, self.dataset, 32, 100)
-                train_step2(self.tom_model, self.dataset, 32, 100)
+                train_step1(self.tom_model, self.dataset, self.batch_size, 100)
+                train_step2(self.tom_model, self.dataset, self.batch_size, 100)
                 tom_model_weight = self.tom_model.state_dict()
 
             # Display training infos

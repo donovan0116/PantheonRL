@@ -14,30 +14,53 @@ MAX_DATASET_NUM = 3200
 
 
 class ToMNet(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, lamb=0.5):
+    def __init__(self, input_size, hidden_size, output_size, lamb=0.5, lstm_num_layers=1, lstm_num_directions=1):
         super(ToMNet, self).__init__()
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.hidden_size = hidden_size
+        self.output_size = output_size
+        self.lstm_num_layers = lstm_num_layers
+        self.lstm_num_directions = lstm_num_directions
         self.lamb = lamb
-        if isinstance(hidden_size, list):
-            self.lstm = nn.LSTM(input_size, hidden_size[0], batch_first=True)
+        self.mu_layer = nn.Linear(self.hidden_size[0], self.hidden_size[0])
+        self.log_var_layer = nn.Linear(self.hidden_size[0], self.hidden_size[0])
+        if isinstance(self.hidden_size, list):
+            self.lstm = nn.LSTM(input_size, self.hidden_size[0], batch_first=True)
             layer = []
-            for i in range(len(hidden_size) - 1):
-                layer.append(nn.Linear(hidden_size[i], hidden_size[i + 1]))
+            for i in range(len(self.hidden_size) - 1):
+                layer.append(nn.Linear(self.hidden_size[i], self.hidden_size[i + 1]))
                 layer.append(nn.Tanh())
-            layer.append(nn.Linear(hidden_size[-1], output_size))
+            layer.append(nn.Linear(self.hidden_size[-1], self.output_size))
             self.decoder = nn.Sequential(*layer)
         else:
-            self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
+            self.lstm = nn.LSTM(input_size, self.hidden_size, batch_first=True)
             # used for training
-            self.decoder = nn.Linear(hidden_size, output_size)
+            self.decoder = nn.Linear(self.hidden_size, self.output_size)
 
     def forward(self, x):
         # x: (batch_size, seq_len, input_size)
-        _, (compress_plan, _) = self.lstm(x)
-        compress_plan = torch.softmax(compress_plan, dim=-1)
-        recovery = self.decoder(compress_plan)
-        return compress_plan, recovery.squeeze(0)
+        if len(x.size()) != 3:
+            print("stop")
+        batch_size, seq_len, input_size = x.size()
+        num_layers = self.lstm_num_layers
+        num_directions = self.lstm_num_directions
+        hidden_size = self.hidden_size[0]
+        h_0 = torch.randn(num_layers * num_directions, batch_size, hidden_size).to(self.device)
+        c_0 = torch.randn(num_layers * num_directions, batch_size, hidden_size).to(self.device)
+        lstm_out, (h_n, c_n) = self.lstm(x, (h_0, c_0))
+        h_last = h_n[-1] if not self.lstm_num_directions == 2 else torch.cat((h_n[-2], h_n[-1]), dim=1)
+        mu = self.mu_layer(h_last)
+        log_var = self.log_var_layer(h_last)
+        std = torch.exp(0.5 * log_var)
+
+        # reparameterization trick
+        eps = torch.randn_like(std)
+        z = mu + std * eps
+        z = z.unsqueeze(0)
+        z = F.softmax(z, dim=-1)
+
+        recovery = self.decoder(z)
+        return z, recovery.squeeze(0)
 
 
 # in the first step of training, we only train the ToMNet as an encoder
@@ -149,6 +172,7 @@ def insert_dataset(dataset, dataset_item: list):
     # list的长度是seq_len，每一项的长度是state_dim+action_dim
     # 首先将其转换为tensor(10, 63)
     # 然后将其插入到dataset中
+    # 尾插法，后端的数据是新的
     dataset_item = torch.stack(dataset_item).to('cuda')
     if dataset_item.dim() == 2:
         dataset_item = dataset_item.unsqueeze(0)
@@ -159,15 +183,26 @@ def batch_generator(dataset, batch_size):
     # dataset的格式为(batch_size, seq_len, input_size)
     # 分别代表批量大小、序列长度、输入维度
     # 这里设定batch_size为32，序列长度为10，输入维度为63
-    while len(dataset) % batch_size != 0:
-        dataset = dataset[0:]
-
-    if len(dataset) > MAX_DATASET_NUM:
-        dataset = dataset[0:MAX_DATASET_NUM]
+    # while len(dataset) % batch_size != 0:
+    #     dataset = dataset[0:]
+    #
+    # if len(dataset) > MAX_DATASET_NUM:
+    #     dataset = dataset[0:MAX_DATASET_NUM]
 
     for i in range(0, len(dataset), batch_size):
         batch_data = dataset[i:i + batch_size]
         yield batch_data
+
+def pre_process_dataset(dataset, batch_size):
+    # dataset由尾插法构成
+    # 首先处理成batch_size整数倍，逐步弹出头部数据
+    while len(dataset) % batch_size != 0:
+        dataset = dataset[1:]
+
+    if len(dataset) > MAX_DATASET_NUM:
+        dataset = dataset[-MAX_DATASET_NUM:]
+
+    return dataset
 
 
 if __name__ == '__main__':

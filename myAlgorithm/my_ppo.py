@@ -52,6 +52,7 @@ class MyPPO(MyOnPolicyAlgorithm):
             fake_dataset_= args["fake_dataset"],
             dataset_seq_len=args["seq_len"],
             create_from_env_factory=args["create_from_env_factory"],
+            batch_size=args["batch_size"],
         )
 
         if args["normalize_advantage"]:
@@ -76,28 +77,28 @@ class MyPPO(MyOnPolicyAlgorithm):
             "output_size": input_size * self.dataset_seq_len
         }
 
-        # 初始化Ray（如果尚未初始化）
-        if not ray.is_initialized():
-            ray.init()
-            # 初始化Ray workers
-            self.workers = []
-            for i in range(self.n_workers):
-                worker = RolloutWorker.remote(
-                    worker_id=i,
-                    args=self.args,
-                    env_maker=env_factory,
-                    policy=self.policy,
-                    observation_space=self.observation_space,
-                    action_space=self.action_space,
-                    device=self.device,
-                    gamma=self.gamma,
-                    use_sde=self.use_sde,
-                    sde_sample_freq=self.sde_sample_freq,
-                    dataset_seq_len=self.dataset_seq_len,
-                    redis_config=self.redis_config,
-                    tom_model_config=self.tom_model_config,
-                )
-                self.workers.append(worker)
+        # # 初始化Ray（如果尚未初始化）
+        # if not ray.is_initialized():
+        #     ray.init()
+        #     # 初始化Ray workers
+        #     self.workers = []
+        #     for i in range(self.n_workers):
+        #         worker = RolloutWorker.remote(
+        #             worker_id=i,
+        #             args=self.args,
+        #             env_maker=env_factory,
+        #             policy=self.policy,
+        #             observation_space=self.observation_space,
+        #             action_space=self.action_space,
+        #             device=self.device,
+        #             gamma=self.gamma,
+        #             use_sde=self.use_sde,
+        #             sde_sample_freq=self.sde_sample_freq,
+        #             dataset_seq_len=self.dataset_seq_len,
+        #             redis_config=self.redis_config,
+        #             tom_model_config=self.tom_model_config,
+        #         )
+        #         self.workers.append(worker)
 
     def _setup_model(self) -> None:
         super()._setup_model()

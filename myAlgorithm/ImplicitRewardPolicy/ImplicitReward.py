@@ -8,8 +8,8 @@ import torch.nn.functional as F
 
 
 # the function now is in discrete version
-def compute_reward_comm(dataset, hidden_old, tom_net, num_state_bins=100, epsilon=1e-10):
-    batch_size, seq_len, feature_dim = dataset.shape
+def compute_reward_comm(dataset, hidden_old, tom_net, batch_size=32, num_state_bins=100, epsilon=1e-10):
+    dataset_len, seq_len, feature_dim = dataset.shape
     state_dim = feature_dim - 1
 
     state = dataset[..., :-1]
@@ -19,9 +19,10 @@ def compute_reward_comm(dataset, hidden_old, tom_net, num_state_bins=100, epsilo
     state_bins = state_bins.to(state.device)
     state_discrete = torch.bucketize(state, state_bins)
 
+    # compute entropy
     joint_hist = torch.zeros((num_state_bins, action.max().item() + 1))
 
-    for i in range(batch_size):
+    for i in range(dataset_len):
         for j in range(seq_len):
             s_idx = state_discrete[i, j].sum().item() % num_state_bins
             a_idx = action[i, j].item()
@@ -37,17 +38,15 @@ def compute_reward_comm(dataset, hidden_old, tom_net, num_state_bins=100, epsilo
 
     inner_entropy = torch.log1p(inner_entropy)
 
-    hidden, _ = tom_net(dataset[:, 0, :])
+    hidden, _ = tom_net(dataset[0:batch_size, :, :])
     log_hidden = torch.log(hidden + epsilon)
     log_hidden_old = torch.log(hidden_old + epsilon)
 
     KL_div = F.kl_div(log_hidden_old, log_hidden.exp(), reduction='batchmean')
 
-    KL_div_min, KL_div_max = 0.1, 1.0
-    KL_div_norm = (KL_div - KL_div_min) / (KL_div_max - KL_div_min)
-    KL_div_norm = torch.clamp(KL_div_norm, 0, 1)
-
     lambda_entropy = 1  # 调整熵的权重
-    reward_internal = -lambda_entropy * inner_entropy - KL_div_norm
+    reward_internal = -lambda_entropy * inner_entropy - KL_div
+    # test: 2025.4.1, test for the change of KL
+    # reward_internal = - KL_div * 1e4
 
     return reward_internal.item(), hidden

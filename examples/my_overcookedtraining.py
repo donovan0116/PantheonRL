@@ -37,7 +37,7 @@ r = redis.Redis(host='127.0.0.1', port=6379, db=0)
 r.flushdb()
 
 partner = OnPolicyAgent(PPO('MlpPolicy', env, verbose=0))
-# partner = SimpleCommunicativePartner(partner)
+partner = SimpleCommunicativePartner(partner)
 env.add_agent(partner, 'partner')
 
 # hyper parameters
@@ -61,8 +61,8 @@ model = ToMNet(input_size=input_size, hidden_size=[64, 256, input_size], output_
 model = model.to('cuda')
 fake_dataset = make_fake_dataset(env, 320, 2)
 args['fake_dataset'] = fake_dataset
-train_step1(model, fake_dataset, 32, 10)
-train_step2(model, fake_dataset, 32, 10)
+train_step1(model, fake_dataset, args["batch_size"], 10)
+train_step2(model, fake_dataset, args["batch_size"], 10)
 # torch.save(model.state_dict(), args['ToM_model_path'])
 print("training finish")
 args['ToM_model'] = model
